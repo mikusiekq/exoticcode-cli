@@ -1,6 +1,6 @@
 {
   "name": "exoticcode",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "EXOTICCODE — agent AI do kodowania w terminalu",
   "type": "module",
   "bin": {
