@@ -1,0 +1,30 @@
+{
+  "name": "exoticcode",
+  "version": "1.0.0",
+  "description": "EXOTICCODE — agent AI do kodowania w terminalu",
+  "type": "module",
+  "bin": {
+    "exoticcode": "bin/exoticcode.js",
+    "exotic": "bin/exoticcode.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "skills"
+  ],
+  "engines": {
+    "node": ">=20.3"
+  },
+  "scripts": {
+    "start": "node bin/exoticcode.js"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mikusiekq/exoticcode-cli.git"
+  },
+  "homepage": "https://github.com/mikusiekq/exoticcode-cli",
+  "bugs": {
+    "url": "https://github.com/mikusiekq/exoticcode-cli/issues"
+  }
+}

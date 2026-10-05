@@ -1,0 +1,40 @@
+name: release
+
+# Wypchnięcie tagu vX.Y.Z (np. przez `npm version patch && git push --follow-tags`)
+# buduje paczkę i tworzy wydanie z plikiem exoticcode.tgz.
+# Stała nazwa pliku daje stały adres najnowszej wersji:
+#   https://github.com/mikusiekq/exoticcode-cli/releases/latest/download/exoticcode.tgz
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Sprawdź zgodność tagu z package.json
+        run: |
+          PKG="v$(node -p "require('./package.json').version")"
+          if [ "$PKG" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME nie zgadza się z wersją w package.json ($PKG)"; exit 1
+          fi
+
+      - name: Zbuduj paczkę
+        run: |
+          npm pack
+          mv exoticcode-*.tgz exoticcode.tgz
+          sha256sum exoticcode.tgz > exoticcode.tgz.sha256
+
+      - name: Utwórz wydanie
+        run: gh release create "$GITHUB_REF_NAME" exoticcode.tgz exoticcode.tgz.sha256 --title "EXOTICCODE $GITHUB_REF_NAME" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}

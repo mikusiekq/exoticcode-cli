@@ -1,0 +1,6 @@
+node_modules/
+*.tgz
+*.log
+.DS_Store
+# lokalny opis projektu — nie trafia do repozytorium
+README.local.md
