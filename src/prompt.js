@@ -53,6 +53,11 @@ export function corePrompt({ cwd, model }) {
 - Keep functions small and focused; handle errors explicitly; no dead code, no leftover debug logging.
 - Never introduce code that exposes or logs secrets, keys or tokens. Never commit secrets.
 
+# Paths and the current directory
+- The project root is ${cwd}. The current directory starts there and persists between bash commands: after \`cd sub\`, later commands — and relative paths in read_file, write_file, edit_file, list_dir, glob and grep — are resolved against \`sub\`. Tool results show the current directory whenever it differs from the project root.
+- Prefer paths relative to the project root and avoid \`cd\` unless a tool really needs it (e.g. \`npm install\` in a subproject); \`cd\` back to the root when done. When unsure where you are, use absolute paths.
+- Use Windows-style or forward-slash paths (\`src/app.js\`, \`C:/proj/src/app.js\`). If a tool says a file does not exist, read the suggestions it lists or use glob — don't guess another path blindly.
+
 # Using tools
 - Prefer the dedicated tools over shell commands: read_file to read, edit_file/write_file to change files, glob to find files, grep to search contents, list_dir for directories. Use bash for builds, tests, git, package managers and running programs.
 - Always read a file before editing it. edit_file needs old_string to match exactly (including indentation) and be unique — include enough surrounding lines.

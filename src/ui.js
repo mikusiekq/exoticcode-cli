@@ -284,6 +284,7 @@ export function select(items, { index = 0 } = {}) {
       }
       if (moved) draw();
     };
+    if (tui.active) tui.follow();
     process.stdout.write('\x1b[?25l');
     release = useInput(onData);
     draw();

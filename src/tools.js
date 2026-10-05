@@ -1,6 +1,8 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { c } from './ui.js';
 import { loadSkill, listSkills } from './skills.js';
 import { todos as todoState } from './todos.js';
@@ -9,9 +11,61 @@ const IS_WIN = process.platform === 'win32';
 const IGNORED_DIRS = new Set(['node_modules', '.git', '.next', '.nuxt', '__pycache__', '.venv', 'venv', '.cache', '.turbo']);
 const MAX_OUTPUT = 30000;
 
-const resolvePath = (p, cwd) => path.resolve(cwd, String(p ?? '.'));
 const rel = (p, cwd) => path.relative(cwd, p) || '.';
 const toPosix = (p) => p.split(path.sep).join('/');
+
+/**
+ * Zamienia ścieżkę podaną przez model na bezwzględną. Modele piszą ścieżki na różne sposoby,
+ * a na Windows część z nich trafiała w złe miejsce:
+ *   "/c/Users/x" (Git Bash)  → C:\Users\x      zamiast C:\c\Users\x
+ *   "/src/a.js" (od projektu) → <projekt>\src\a.js zamiast C:\src\a.js
+ *   "~/x", "file:///…", ścieżki w cudzysłowach.
+ * `cwd` — bieżący katalog (zmienia go `cd` w bash), `root` — katalog projektu.
+ */
+export function resolvePath(input, cwd, root = cwd) {
+  let p = String(input ?? '.').trim().replace(/^(["'`])(.*)\1$/, '$2').trim();
+  if (!p) p = '.';
+  if (/^file:\/\//i.test(p)) {
+    try {
+      p = fileURLToPath(p);
+    } catch {}
+  }
+  if (p === '~' || p.startsWith('~/') || p.startsWith('~\\')) p = path.join(os.homedir(), p.slice(1));
+  if (IS_WIN) {
+    const m = p.match(/^\/mnt\/([a-zA-Z])(\/.*)?$/) || p.match(/^\/([a-zA-Z])(\/.*)?$/);
+    if (m) return path.resolve(`${m[1].toUpperCase()}:${m[2] || '\\'}`);
+    if (/^[\\/](?![\\/])/.test(p)) {
+      const fromDrive = path.resolve(cwd, p);
+      const fromRoot = path.join(root, p);
+      if (!fs.existsSync(fromDrive) && (fs.existsSync(fromRoot) || fs.existsSync(path.dirname(fromRoot)))) return fromRoot;
+    }
+  }
+  return path.resolve(cwd, p);
+}
+
+/** Pliki o podobnej nazwie w projekcie — podpowiedź, gdy model poda złą ścieżkę. */
+function similarFiles(target, root, max = 5) {
+  const name = path.basename(target).toLowerCase();
+  if (!name || name === '.') return [];
+  const exact = [];
+  const partial = [];
+  for (const f of walk(root, { limit: 20000 })) {
+    const base = path.basename(f).toLowerCase();
+    if (base === name) exact.push(f);
+    else if (name.length >= 3 && (base.includes(name) || name.includes(base.replace(/\.[^.]+$/, '')))) partial.push(f);
+    if (exact.length >= max) break;
+  }
+  return [...exact, ...partial].slice(0, max).map((f) => toPosix(rel(f, root)));
+}
+
+function notFound(kind, p, ctx) {
+  let msg = `${kind} nie istnieje: ${p}`;
+  if (ctx.root && ctx.cwd !== ctx.root) msg += `\n(bieżący katalog: ${ctx.cwd}, katalog projektu: ${ctx.root})`;
+  const similar = similarFiles(p, ctx.root || ctx.cwd);
+  if (similar.length) msg += `\nPodobne pliki w projekcie (ścieżki od katalogu projektu):\n${similar.map((s) => '  ' + s).join('\n')}`;
+  else msg += '\nUżyj glob albo list_dir, żeby znaleźć właściwą ścieżkę.';
+  return { isError: true, output: msg };
+}
 
 function clip(text, max = MAX_OUTPUT) {
   if (text.length <= max) return text;
@@ -25,7 +79,9 @@ function isBinary(buf) {
   return false;
 }
 
-function* walk(dir, limit = 50000) {
+// Przechodzi pliki w katalogu. `stats.truncated` = true, gdy przerwano po `limit` plikach
+// (wcześniej działo się to po cichu i agent dostawał „brak dopasowań” w dużych projektach).
+function* walk(dir, { limit = 50000, stats } = {}) {
   const stack = [dir];
   let count = 0;
   while (stack.length) {
@@ -36,12 +92,16 @@ function* walk(dir, limit = 50000) {
     } catch {
       continue;
     }
+    entries.sort((a, b) => b.name.localeCompare(a.name)); // stała kolejność między uruchomieniami
     for (const e of entries) {
       const full = path.join(d, e.name);
       if (e.isDirectory()) {
         if (!IGNORED_DIRS.has(e.name)) stack.push(full);
       } else if (e.isFile()) {
-        if (++count > limit) return;
+        if (++count > limit) {
+          if (stats) stats.truncated = true;
+          return;
+        }
         yield full;
       }
     }
@@ -97,13 +157,29 @@ function killTree(child) {
   }
 }
 
+// Po komendzie wypisujemy znacznik z katalogiem, w którym skończyła — dzięki temu `cd`
+// działa między komendami (wcześniej każda komenda startowała od nowa z katalogu projektu).
+const CWD_MARK = '__EXO_CWD__';
+
+function wrapCommand(command) {
+  if (IS_WIN) {
+    return `[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; $OutputEncoding=[System.Text.Encoding]::UTF8
+${command}
+$__exoOk = $?; $__exoCode = $LASTEXITCODE
+Write-Output ('${CWD_MARK}' + (Get-Location).ProviderPath)
+if (-not $__exoOk) { if ($__exoCode -is [int] -and $__exoCode -ne 0) { exit $__exoCode } else { exit 1 } }`;
+  }
+  return `${command}
+__exo_s=$?; printf '\\n${CWD_MARK}%s\\n' "$(pwd)"; exit $__exo_s`;
+}
+
+/** Uruchamia komendę. Zwraca { code, output, timedOut, cwd } — cwd to katalog po zakończeniu. */
 export function runShell(command, { cwd, timeout = 120000, signal } = {}) {
   return new Promise((resolve) => {
+    if (cwd && !fs.existsSync(cwd)) cwd = process.cwd();
     const child = IS_WIN
-      ? spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
-          `[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; $OutputEncoding=[System.Text.Encoding]::UTF8; ${command}`],
-          { cwd, windowsHide: true })
-      : spawn(process.env.SHELL || '/bin/bash', ['-c', command], { cwd, detached: true });
+      ? spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', wrapCommand(command)], { cwd, windowsHide: true })
+      : spawn(process.env.SHELL || '/bin/bash', ['-c', wrapCommand(command)], { cwd, detached: true });
     let output = '';
     let timedOut = false;
     const onData = (d) => {
@@ -126,7 +202,16 @@ export function runShell(command, { cwd, timeout = 120000, signal } = {}) {
     child.on('close', (code) => {
       clearTimeout(timer);
       signal?.removeEventListener('abort', onAbort);
-      resolve({ code, output: output.replace(/\r\n/g, '\n'), timedOut });
+      let text = output.replace(/\r\n/g, '\n');
+      let endCwd = cwd;
+      const at = text.lastIndexOf(CWD_MARK);
+      if (at !== -1) {
+        const lineEnd = text.indexOf('\n', at);
+        const found = text.slice(at + CWD_MARK.length, lineEnd === -1 ? undefined : lineEnd).trim();
+        if (found && fs.existsSync(found)) endCwd = found;
+        text = (text.slice(0, at).replace(/\n$/, '') + (lineEnd === -1 ? '' : text.slice(lineEnd + 1))).replace(/\n+$/, '\n');
+      }
+      resolve({ code, output: text, timedOut, cwd: endCwd });
     });
   });
 }
@@ -148,9 +233,9 @@ export const TOOLS = [
       required: ['path'],
     },
     summary: (i) => i.path,
-    async run(input, { cwd }) {
-      const p = resolvePath(input.path, cwd);
-      if (!fs.existsSync(p)) return { isError: true, output: `Plik nie istnieje: ${p}` };
+    async run(input, ctx) {
+      const p = resolvePath(input.path, ctx.cwd, ctx.root);
+      if (!fs.existsSync(p)) return notFound('Plik', p, ctx);
       const st = fs.statSync(p);
       if (st.isDirectory()) return { isError: true, output: `${p} to katalog — użyj list_dir.` };
       if (st.size > 10 * 1024 * 1024) return { isError: true, output: 'Plik jest za duży (>10MB).' };
@@ -179,8 +264,8 @@ export const TOOLS = [
       required: ['path', 'content'],
     },
     summary: (i) => i.path,
-    preview(input, { cwd }) {
-      const p = resolvePath(input.path, cwd);
+    preview(input, ctx) {
+      const p = resolvePath(input.path, ctx.cwd, ctx.root);
       const content = String(input.content ?? '');
       const lines = content.split('\n');
       const head = fs.existsSync(p) ? c.yellow(`Nadpisze istniejący plik (${lines.length} linii)`) : c.green(`Nowy plik (${lines.length} linii)`);
@@ -188,8 +273,8 @@ export const TOOLS = [
       if (lines.length > 15) shown.push(c.dim(`… (+${lines.length - 15} linii)`));
       return [head, ...shown];
     },
-    async run(input, { cwd }) {
-      const p = resolvePath(input.path, cwd);
+    async run(input, ctx) {
+      const p = resolvePath(input.path, ctx.cwd, ctx.root);
       const content = String(input.content ?? '');
       fs.mkdirSync(path.dirname(p), { recursive: true });
       const existed = fs.existsSync(p);
@@ -217,9 +302,9 @@ export const TOOLS = [
     preview(input) {
       return lineDiff(String(input.old_string ?? ''), String(input.new_string ?? ''));
     },
-    async run(input, { cwd }) {
-      const p = resolvePath(input.path, cwd);
-      if (!fs.existsSync(p)) return { isError: true, output: `Plik nie istnieje: ${p}` };
+    async run(input, ctx) {
+      const p = resolvePath(input.path, ctx.cwd, ctx.root);
+      if (!fs.existsSync(p)) return notFound('Plik', p, ctx);
       let text = fs.readFileSync(p, 'utf8');
       let oldS = String(input.old_string ?? '');
       let newS = String(input.new_string ?? '');
@@ -249,18 +334,30 @@ export const TOOLS = [
       properties: { path: { type: 'string', description: 'Directory path (default: working directory)' } },
     },
     summary: (i) => i.path || '.',
-    async run(input, { cwd }) {
-      const p = resolvePath(input.path || '.', cwd);
+    async run(input, ctx) {
+      const p = resolvePath(input.path || '.', ctx.cwd, ctx.root);
+      if (!fs.existsSync(p)) return notFound('Katalog', p, ctx);
+      if (!fs.statSync(p).isDirectory()) return { isError: true, output: `${p} to plik, nie katalog — użyj read_file.` };
       let entries;
       try {
         entries = fs.readdirSync(p, { withFileTypes: true });
       } catch (e) {
-        return { isError: true, output: `Nie można odczytać katalogu: ${e.message}` };
+        return { isError: true, output: `Nie można odczytać katalogu ${p}: ${e.message}` };
       }
-      entries.sort((a, b) => (b.isDirectory() - a.isDirectory()) || a.name.localeCompare(b.name));
-      const lines = entries.slice(0, 1000).map((e) => (e.isDirectory() ? e.name + '/' : e.name));
+      const isDir = (e) => {
+        if (e.isDirectory()) return true;
+        if (!e.isSymbolicLink()) return false;
+        try {
+          return fs.statSync(path.join(p, e.name)).isDirectory();
+        } catch {
+          return false;
+        }
+      };
+      entries.sort((a, b) => (isDir(b) - isDir(a)) || a.name.localeCompare(b.name));
+      const lines = entries.slice(0, 1000).map((e) => (isDir(e) ? e.name + '/' : e.name));
       if (entries.length > 1000) lines.push(`… (+${entries.length - 1000})`);
-      return { output: lines.join('\n') || '(pusty katalog)', display: `${entries.length} elementów` };
+      // pełna ścieżka na górze — agent zawsze wie, który katalog ogląda
+      return { output: `${p}:\n${lines.join('\n') || '(pusty katalog)'}`, display: `${entries.length} elementów` };
     },
   },
   {
@@ -276,18 +373,24 @@ export const TOOLS = [
       required: ['pattern'],
     },
     summary: (i) => i.pattern + (i.path ? ` w ${i.path}` : ''),
-    async run(input, { cwd }) {
-      const root = resolvePath(input.path || '.', cwd);
+    async run(input, ctx) {
+      const cwd = ctx.cwd;
+      const root = resolvePath(input.path || '.', ctx.cwd, ctx.root);
+      if (!fs.existsSync(root)) return notFound('Katalog', root, ctx);
       const re = globToRegex(input.pattern);
       const found = [];
-      for (const f of walk(root)) {
+      const stats = {};
+      for (const f of walk(root, { stats })) {
         if (re.test(toPosix(path.relative(root, f)))) {
           found.push(f);
           if (found.length >= 1000) break;
         }
       }
       const lines = found.map((f) => toPosix(rel(f, cwd))).sort();
-      return { output: lines.join('\n') || 'Brak dopasowań.', display: `${found.length} plików` };
+      let note = `\n\n(szukano w ${root}; ścieżki względem ${cwd})`;
+      if (found.length >= 1000) note += '\n(pokazano pierwsze 1000 — zawęź wzorzec albo path)';
+      if (stats.truncated) note += '\n(przerwano po 50000 plikach — podaj węższy katalog w path)';
+      return { output: (lines.join('\n') || 'Brak dopasowań.') + note, display: `${found.length} plików` };
     },
   },
   {
@@ -305,16 +408,19 @@ export const TOOLS = [
       required: ['pattern'],
     },
     summary: (i) => i.pattern + (i.glob ? ` (${i.glob})` : ''),
-    async run(input, { cwd }) {
+    async run(input, ctx) {
       let re;
       try {
         re = new RegExp(input.pattern, input.ignore_case ? 'i' : '');
       } catch (e) {
         return { isError: true, output: `Niepoprawny regex: ${e.message}` };
       }
-      const root = resolvePath(input.path || '.', cwd);
+      const cwd = ctx.cwd;
+      const root = resolvePath(input.path || '.', ctx.cwd, ctx.root);
+      if (!fs.existsSync(root)) return notFound('Ścieżka', root, ctx);
       const globRe = input.glob ? globToRegex(input.glob) : null;
-      const files = fs.existsSync(root) && fs.statSync(root).isFile() ? [root] : walk(root);
+      const stats = {};
+      const files = fs.statSync(root).isFile() ? [root] : walk(root, { stats });
       const matches = [];
       let fileCount = 0;
       outer: for (const f of files) {
@@ -339,8 +445,12 @@ export const TOOLS = [
         }
         if (hit) fileCount++;
       }
+      let note = '';
+      if (matches.length >= 300) note += '\n\n(pokazano pierwsze 300 dopasowań — zawęź wzorzec albo glob)';
+      if (stats.truncated) note += '\n\n(przerwano po 50000 plikach — podaj węższy katalog w path)';
+      if (!matches.length) note += `\n(szukano w ${root})`;
       return {
-        output: matches.join('\n') || 'Brak dopasowań.',
+        output: (matches.join('\n') || 'Brak dopasowań.') + note,
         display: `${matches.length} dopasowań w ${fileCount} plikach`,
       };
     },
@@ -362,18 +472,23 @@ export const TOOLS = [
     },
     summary: (i) => i.command,
     preview: (i) => [c.cyan(String(i.command ?? ''))],
-    async run(input, { cwd, signal }) {
+    async run(input, ctx) {
       const timeout = Math.min(600, Math.max(1, input.timeout || 120)) * 1000;
-      const r = await runShell(String(input.command ?? ''), { cwd, timeout, signal });
+      const r = await runShell(String(input.command ?? ''), { cwd: ctx.cwd, timeout, signal: ctx.signal });
+      const moved = r.cwd && r.cwd !== ctx.cwd;
+      if (r.cwd) ctx.setCwd?.(r.cwd);
       const text = clip(r.output.trimEnd());
       const status = r.timedOut ? `Przekroczono limit czasu (${timeout / 1000}s)` : `Kod wyjścia: ${r.code}`;
       const shown = text.replace(/^(\s*\n)+/, '');
       const lines = shown ? shown.split('\n') : [];
       const preview = lines.slice(0, 6);
       if (lines.length > 6) preview.push(`… (+${lines.length - 6} linii)`);
+      // bieżący katalog podajemy, gdy różni się od katalogu projektu — żeby agent się nie zgubił
+      const where = r.cwd && ctx.root && r.cwd !== ctx.root ? ` · katalog: ${r.cwd}` : '';
+      if (moved) preview.push(`→ katalog: ${r.cwd}`);
       return {
         isError: r.code !== 0,
-        output: `${text || '(brak wyjścia)'}\n\n[${status}]`,
+        output: `${text || '(brak wyjścia)'}\n\n[${status}${where}]`,
         display: preview.length ? preview : ['(brak wyjścia)'],
         displayStatus: status,
       };
@@ -420,7 +535,8 @@ TOOLS.push({
     required: ['name'],
   },
   summary: (i) => i.name,
-  async run(input, { cwd }) {
+  async run(input, ctx) {
+    const cwd = ctx.root || ctx.cwd;
     const loaded = loadSkill(cwd, input.name);
     if (!loaded) {
       const names = listSkills(cwd).map((s) => s.name).join(', ') || 'brak';

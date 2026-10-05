@@ -1,6 +1,7 @@
 import readline from 'node:readline';
 import { c, accent } from './ui.js';
 import { useInput, takeTypeahead, pushTypeahead } from './input.js';
+import { isShiftDown } from './winshift.js';
 
 export const stripAnsi = (s) => String(s).replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
 export const width = (s) => Array.from(stripAnsi(s)).length;
@@ -16,8 +17,8 @@ const NEWLINE_SEQS = new Set([
   '\n', // Ctrl+Enter na Windows
 ]);
 
-// Shift+Tab (na Windows dociera jak zwykły Tab) i Alt+M — zmiana trybu uprawnień.
-const MODE_SEQS = new Set(['\x1b[Z', '\x1bm', '\x1bM']);
+// Shift+Tab (sekwencja \x1b[Z; na Windows bez niej — patrz obsługa '\t') — zmiana trybu uprawnień.
+const MODE_SEQS = new Set(['\x1b[Z']);
 
 const KEYS = {
   '\x1b[A': 'up', '\x1bOA': 'up',
@@ -48,8 +49,8 @@ export function tokenize(data) {
       } else if (next === 'O' && i + 2 < data.length) {
         out.push(data.slice(i, i + 3));
         i += 3;
-      } else if (next !== undefined && 'bfmM\r\n'.includes(next)) {
-        // Alt+b / Alt+f (słowa), Alt+m (tryb), Alt+Enter (nowa linia)
+      } else if (next !== undefined && 'bf\r\n'.includes(next)) {
+        // Alt+b / Alt+f (słowa), Alt+Enter (nowa linia)
         out.push(data.slice(i, i + 2));
         i += 2;
       } else {
@@ -196,7 +197,8 @@ export class InputBuffer {
     const buf = this.buf;
     switch (k) {
       case '\r':
-        if (pasteNewline) return this.insert('\n');
+        // Shift+Enter na Windows przychodzi jako zwykły Enter — sprawdzamy stan klawisza Shift
+        if (pasteNewline || isShiftDown()) return this.insert('\n');
         return this.submit();
       case '\x03':
         return this.emit({ type: 'ctrlc' });
@@ -213,12 +215,11 @@ export class InputBuffer {
         }
         return;
       case '\t': {
+        // Shift+Tab na Windows przychodzi jako zwykły Tab — rozpoznajemy go po wciśniętym Shift
+        if (isShiftDown()) return this.emit({ type: 'mode' });
         const sugs = this.suggestions();
-        if (sugs.length) {
-          this.set(sugs[this.sugIdx][0] + ' ');
-          return;
-        }
-        return this.emit({ type: 'mode' });
+        if (sugs.length) this.set(sugs[this.sugIdx][0] + ' ');
+        return;
       }
       case '\x1b':
         return this.emit({ type: 'escape' });

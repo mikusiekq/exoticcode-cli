@@ -48,6 +48,8 @@ const DEFAULTS = {
   mascot: true,
   // sprawdzanie i instalowanie nowej wersji z GitHuba przy starcie
   autoUpdate: true,
+  // przewijanie czatu kółkiem myszy (zaznaczanie tekstu wtedy z Shift)
+  mouse: true,
   // 'auto' (nic nie wysyłamy) | 'low' | 'medium' | 'high' | 'max'
   effort: 'auto',
 };

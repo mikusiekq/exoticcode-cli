@@ -17,6 +17,7 @@ import { useInput, pushTypeahead } from './input.js';
 import { hud } from './mascot.js';
 import { tui, MODES, MODE_ORDER } from './tui.js';
 import { planTerminalSetup } from './terminal-setup.js';
+import { startShiftWatcher } from './winshift.js';
 import { listSkills, installSkills, availableSkills, removeSkill, RECOMMENDED, SKILLS_DIR } from './skills.js';
 
 const stdin = process.stdin;
@@ -42,6 +43,7 @@ const COMMANDS = [
   ['/format', 'Format API: auto | anthropic | openai'],
   ['/mode', 'Tryb uprawnień: manual | auto | bypass | plan (albo Shift+Tab)'],
   ['/mascot', 'Pokaż/ukryj maskotkę (on | off)'],
+  ['/mouse', 'Przewijanie czatu kółkiem myszy (on | off)'],
   ['/yolo', 'Przełącz tryb bypass permissions'],
   ['/cost', 'Zużycie tokenów w tej sesji'],
   ['/config', 'Pokaż konfigurację'],
@@ -220,6 +222,7 @@ class App {
       });
     }
     tui.showMascot = this.config.mascot !== false;
+    tui.mouseWanted = this.config.mouse !== false;
     const ok = tui.enable({ input: this.input, onKeys: (d) => this.input.feed(d) });
     this.refreshHud();
     return ok;
@@ -265,6 +268,7 @@ class App {
 
   // Wiadomości wpisane w trakcie pracy czekają w kolejce i idą po kolei.
   async pump() {
+    tui.follow();
     this.refreshHud();
     if (this.busy) return;
     this.busy = true;
@@ -321,6 +325,7 @@ class App {
 
   async askPermission(tool, input, preview) {
     hud.setState('asking');
+    tui.follow();
     out(accent('╭─ ') + c.bold(`${tool.label} — potrzebna zgoda`));
     for (const l of preview) out(accent('│ ') + l);
     out(accent('╰─ ') + `${c.bold('[y]')} tak   ${c.bold('[a]')} zawsze dla ${tool.label} w tej sesji   ${c.bold('[n]')} nie`);
@@ -614,6 +619,21 @@ class App {
         out(on ? c.green('  ✔ Maskotka włączona.') : c.green('  ✔ Maskotka ukryta — /mascot on pokazuje ją z powrotem.'));
         return;
       }
+      case '/mouse': {
+        const v = (arg || '').toLowerCase();
+        const on = v ? ['on', 'tak', '1'].includes(v) : !tui.mouseOn;
+        this.config.mouse = on;
+        saveConfig(this.config);
+        tui.mouseWanted = on;
+        if (on) {
+          const ok = await tui.enableMouse();
+          out(ok ? c.green('  ✔ Przewijanie kółkiem myszy włączone (zaznaczanie tekstu: przytrzymaj Shift).') : c.yellow('  ! Ten terminal nie przesyła zdarzeń myszy — przewijaj PgUp/PgDn.'));
+        } else {
+          tui.disableMouse();
+          out(c.green('  ✔ Mysz wyłączona — zwykłe zaznaczanie tekstu, przewijanie PgUp/PgDn.'));
+        }
+        return;
+      }
       case '/yolo':
         this.mode = this.mode === 'bypass' ? 'manual' : 'bypass';
         this.refreshHud();
@@ -665,7 +685,7 @@ class App {
       case '/exit':
       case '/quit':
       case '/q':
-        this.exit();
+        await this.exit();
         return;
       case '/terminal-setup': {
         const plan = planTerminalSetup();
@@ -789,7 +809,9 @@ class App {
   }
 
   async shell(cmd) {
-    const r = await runShell(cmd, { cwd: this.cwd });
+    // `!cd folder` działa tak samo jak cd agenta — oba korzystają z tego samego bieżącego katalogu
+    const r = await runShell(cmd, { cwd: this.agent.shellCwd || this.cwd });
+    if (r.cwd) this.agent.shellCwd = r.cwd;
     if (r.output) process.stdout.write(r.output.endsWith('\n') ? r.output : r.output + '\n');
     out(c.dim(`  [kod wyjścia: ${r.code}]`));
     this.agent.notes.push(`<user-shell-command>\n$ ${cmd}\n${r.output.slice(-8000)}\n[exit code: ${r.code}]\n</user-shell-command>`);
@@ -803,8 +825,10 @@ class App {
     return this.runAgent(text);
   }
 
-  exit() {
-    tui.disable({ keep: true });
+  async exit() {
+    // tryb myszy w konsoli trzeba zdjąć, zanim proces się skończy (cmd by go nie zrozumiał)
+    await tui.disableMouse();
+    tui.disable();
     saveHistory(this.history);
     this.saveSession();
     out(c.dim('Do zobaczenia!'));
@@ -833,6 +857,7 @@ class App {
   }
 
   async interactive(initial, cont) {
+    startShiftWatcher();
     if (!this.config.token) await this.login();
     else {
       this.startTui();
@@ -853,9 +878,9 @@ class App {
     while (true) {
       out();
       const r = await this.prompt(accent('❯ '), { main: true });
-      if (r.type === 'eof') this.exit();
+      if (r.type === 'eof') return this.exit();
       if (r.type === 'sigint') {
-        if (Date.now() - this.lastSigint < 2000) this.exit();
+        if (Date.now() - this.lastSigint < 2000) return this.exit();
         this.lastSigint = Date.now();
         out(c.dim('  (naciśnij Ctrl+C ponownie, aby wyjść)'));
         continue;

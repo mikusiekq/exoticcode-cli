@@ -6,13 +6,21 @@
 
 import { rawWrite, rawWriteErr } from './term.js';
 import { hud, MASCOT_W, MASCOT_ROWS } from './mascot.js';
-import { renderSuggestions, width as textWidth } from './editor.js';
+import { renderSuggestions, width as textWidth, tokenize } from './editor.js';
 import { useInput } from './input.js';
 import { todos } from './todos.js';
+import { ChatBuffer, charWidth } from './screenbuf.js';
+import { setVtInput } from './winshift.js';
 
 const stdout = process.stdout;
 const HEADER = MASCOT_ROWS + 1; // wiersze maskotki + linia oddzielająca
 const MAX_INPUT_ROWS = 8;
+// raportowanie myszy (przyciski + kółko) w formacie SGR
+const MOUSE_ON = '\x1b[?1000h\x1b[?1006h';
+const MOUSE_OFF = '\x1b[?1006l\x1b[?1000l';
+// osobny ekran terminala (bez historii przewijania)
+const ALT_ON = '\x1b[?1049h';
+const ALT_OFF = '\x1b[?1049l';
 
 const CSI = '\x1b[';
 const cup = (row, col) => `${CSI}${row};${col}H`;
@@ -47,15 +55,6 @@ function gradient(text, total = [...text].length) {
     .join('') + '\x1b[39m';
 }
 
-function charWidth(cp) {
-  if (cp >= 0x300 && cp <= 0x36f) return 0;
-  if (
-    (cp >= 0x1100 && cp <= 0x115f) || (cp >= 0x2e80 && cp <= 0xa4cf) || (cp >= 0xac00 && cp <= 0xd7a3) ||
-    (cp >= 0xf900 && cp <= 0xfaff) || (cp >= 0xfe30 && cp <= 0xfe4f) || (cp >= 0xff00 && cp <= 0xff60) ||
-    (cp >= 0xffe0 && cp <= 0xffe6) || (cp >= 0x1f300 && cp <= 0x1faff) || cp === 0x2615 || cp === 0x26a1
-  ) return 2;
-  return 1;
-}
 
 /** Przycina tekst z kodami ANSI do `max` kolumn (kody zostają nietknięte). */
 export function fitAnsi(s, max) {
@@ -104,8 +103,19 @@ class Tui {
     this.queued = 0;
     this.showMascot = true;
     this.footerH = 0;
-    this.o = { row: 0, col: 0, pending: false, saved: null };
-    this.onResize = () => this.redraw(false);
+    this.buf = new ChatBuffer();
+    this.scroll = 0; // ile wierszy w górę od najnowszych
+    this.unseen = false; // przyszła nowa treść, gdy widok był przewinięty
+    // przy zmianie rozmiaru okna: chwilę poczekaj (okno zmienia się wieloma krokami),
+    // potem wyczyść cały ekran i narysuj wszystko od nowa z pamięci
+    this.onResize = () => {
+      this.resizing = true;
+      clearTimeout(this.resizeTimer);
+      this.resizeTimer = setTimeout(() => {
+        this.resizing = false;
+        this.redraw(false, true);
+      }, 80);
+    };
     this.cursor = { row: 1, col: 1 };
   }
 
@@ -139,7 +149,8 @@ class Tui {
     };
     process.stderr.write = stdout.write;
     this.releaseInput = useInput((d) => {
-      onKeys(d);
+      const rest = this.handleScrollKeys(d);
+      if (rest) onKeys(rest);
       this.drawFooter();
     });
     if (!this.hudHooked) {
@@ -151,17 +162,22 @@ class Tui {
     this.timer.unref?.();
     stdout.on('resize', this.onResize);
     if (!this.exitHook) {
-      this.exitHook = () => this.active && rawWrite(`${CSI}r${cup(this.rows, 1)}\n\x1b[?2004l\x1b[?25h`);
+      this.exitHook = () => this.active && rawWrite(`${MOUSE_OFF}${CSI}r${ALT_OFF}\x1b[?2004l\x1b[?25h`);
       process.on('exit', this.exitHook);
     }
-    rawWrite('\x1b[?2004h');
+    // Osobny ekran terminala (jak vim/htop): bez historii przewijania, więc bez bocznego paska
+    // i bez kopii headera, które terminal spychał do historii przy zmianie rozmiaru okna.
+    // Czat przewija się z własnej pamięci (kółko, PgUp/PgDn). ?1007l — kółko nie udaje strzałek.
+    rawWrite(`${ALT_ON}\x1b[?1007l\x1b[?2004h`);
     this.redraw(true);
+    this.enableMouse();
     return true;
   }
 
-  /** Wyłącza układ. `keep` — zostaw treść na ekranie (przy wyjściu z programu). */
-  disable({ keep = false } = {}) {
+  /** Wyłącza układ i wraca do zwykłego ekranu terminala (tego sprzed uruchomienia). */
+  disable() {
     if (!this.active) return;
+    this.disableMouse();
     this.active = false;
     delete stdout.write;
     delete process.stderr.write;
@@ -170,28 +186,109 @@ class Tui {
     this.releaseInput?.();
     clearInterval(this.timer);
     stdout.off('resize', this.onResize);
-    if (keep) rawWrite(`${CSI}r${cup(this.rows, 1)}\n\x1b[?2004l\x1b[?25h`);
-    else rawWrite(`${CSI}r${CSI}2J${CSI}3J${CSI}H\x1b[?2004l\x1b[?25h`);
+    clearTimeout(this.resizeTimer);
+    rawWrite(`${CSI}r${CSI}2J${CSI}H${ALT_OFF}\x1b[?2004l\x1b[?25h`);
   }
 
   // ---------- rysowanie całości ----------
 
-  /** Rysuje header i dół. `clear` — wyczyść też czat. */
-  redraw(clear) {
+  /** Rysuje header, czat i dół. `clear` — wyczyść też pamięć czatu, `wipe` — wyczyść ekran. */
+  redraw(clear, wipe = false) {
     if (!this.active) return;
     this.footerH = this.footerLines().length;
     let s = `${CSI}?25l${CSI}r`;
+    if (wipe && !clear) s += `\x1b[0m${CSI}2J${CSI}H`;
     if (clear) {
       s += `${CSI}2J${CSI}3J${CSI}H`;
-      this.o = { row: 0, col: 0, pending: false, saved: null };
-    } else {
-      this.o.row = Math.min(this.o.row, this.regionH - 1);
-      this.o.col = Math.min(this.o.col, this.cols - 1);
+      this.buf.clear();
+      this.scroll = 0;
+      this.unseen = false;
     }
     s += `${CSI}${this.top};${this.bottom}r`;
     s += this.headerString();
+    this.syncBuf();
+    s += this.viewportString();
     rawWrite(s);
     this.drawFooter();
+  }
+
+  // wymiary obszaru czatu przekazane do pamięci ekranu
+  syncBuf() {
+    this.buf.viewH = this.regionH;
+    this.buf.cols = this.cols;
+    this.buf.screenTop = this.top;
+    this.scroll = Math.min(this.scroll, this.buf.followTop);
+  }
+
+  /** Odrysowuje widoczną część czatu z pamięci (uwzględnia przewinięcie). */
+  viewportString() {
+    const start = this.buf.followTop - this.scroll;
+    let s = '';
+    for (let r = 0; r < this.regionH; r++) s += cup(this.top + r, 1) + `\x1b[0m${CSI}2K` + this.buf.renderRow(start + r, this.cols);
+    return s;
+  }
+
+  // ---------- przewijanie czatu ----------
+
+  /** Przewija o `n` wierszy (dodatnie — w górę, do starszych wiadomości). */
+  scrollBy(n) {
+    this.syncBuf();
+    const next = Math.max(0, Math.min(this.buf.followTop, this.scroll + n));
+    if (next === this.scroll) return;
+    this.scroll = next;
+    if (!next) this.unseen = false;
+    rawWrite(`${CSI}?25l` + this.viewportString() + this.footerString());
+  }
+
+  scrollToTop() {
+    this.scrollBy(this.buf.followTop);
+  }
+
+  /** Wraca na dół czatu (najnowsza treść). */
+  follow() {
+    if (this.scroll) this.scrollBy(-this.scroll);
+  }
+
+  // klawisze przewijania — wyłapywane, zanim reszta trafi do pola wpisywania
+  handleScrollKeys(data) {
+    const page = Math.max(1, this.regionH - 2);
+    let rest = '';
+    for (const k of tokenize(data)) {
+      if (k === '\x1b[5~') this.scrollBy(page); // PgUp
+      else if (k === '\x1b[6~') this.scrollBy(-page); // PgDn
+      else if (k === '\x1b[1;2A') this.scrollBy(1); // Shift+↑
+      else if (k === '\x1b[1;2B') this.scrollBy(-1); // Shift+↓
+      else if (k === '\x1b[1;5H') this.scrollToTop(); // Ctrl+Home
+      else if (k === '\x1b[1;5F') this.follow(); // Ctrl+End
+      else if (k.startsWith('\x1b[<')) {
+        // mysz (SGR): kółko w górę = 64, w dół = 65; kliknięcia i ruch pomijamy
+        const m = k.match(/^\x1b\[<(\d+);\d+;\d+[Mm]$/);
+        const button = m ? Number(m[1]) & ~(4 | 8 | 16) : -1; // bez bitów Shift/Alt/Ctrl
+        if (button === 64) this.scrollBy(3);
+        else if (button === 65) this.scrollBy(-3);
+      } else rest += k;
+    }
+    return rest;
+  }
+
+  // ---------- mysz ----------
+
+  async enableMouse() {
+    if (!this.active || this.mouseOn || this.mouseWanted === false) return false;
+    // Windows: najpierw tryb konsoli, w którym terminal przesyła mysz jako tekst
+    if (!(await setVtInput(true))) return false;
+    if (!this.active) return false;
+    rawWrite(MOUSE_ON);
+    this.mouseOn = true;
+    return true;
+  }
+
+  /** Wyłącza mysz. Zwraca obietnicę — przy wyjściu z programu trzeba na nią poczekać. */
+  disableMouse() {
+    if (!this.mouseOn) return Promise.resolve();
+    rawWrite(MOUSE_OFF);
+    this.mouseOn = false;
+    return setVtInput(false, 2000);
   }
 
   clear() {
@@ -243,7 +340,7 @@ class Tui {
   }
 
   tick() {
-    if (!this.active) return;
+    if (!this.active || this.resizing) return;
     hud.tick();
     if (this.showMascot && !process.env.NO_COLOR) rawWrite('\x1b7' + this.mascotString() + '\x1b8');
   }
@@ -276,7 +373,10 @@ class Tui {
     // bieżący krok z listy zadań (todo_write)
     const step = todos.current();
     const stepText = step ? `${yellow('◐')} ${dim(`${step.done + 1}/${step.total}`)} ${bold(step.item.content)}` : '';
-    const parts = [this.status, stepText, mascotText].filter(Boolean);
+    const scrollText = this.scroll
+      ? yellow(`↑ przewinięto o ${this.scroll} ${this.scroll === 1 ? 'wiersz' : 'wierszy'}`) + dim(this.unseen ? ' · jest nowa treść · PgDn / Ctrl+End na dół' : ' · PgDn / Ctrl+End na dół')
+      : '';
+    const parts = [scrollText, this.status, stepText, mascotText].filter(Boolean);
     lines.push(fitAnsi(' ' + parts.join('   ' + dim('·') + '  '), cols));
 
     // 2. pole w ramce
@@ -325,11 +425,12 @@ class Tui {
       for (const l of renderSuggestions(sugs, this.input.sugIdx, cols)) lines.push(fitAnsi(l, cols));
     } else {
       const m = MODES[this.info.mode] || MODES.manual;
-      const modeText = `${border(m.icon + ' ' + m.label)} ${dim('— ' + m.hint + ' (shift+tab)')}`;
+      const modeText = `${border(m.icon + ' ' + m.label)} ${dim('(shift+tab)')}`;
       const parts = [
         modeText,
         `↑${fmt(this.info.input)} ↓${fmt(this.info.output)} ${dim('tokenów')}`,
         dim('Shift+Enter nowa linia'),
+        dim(this.mouseOn ? 'kółko/PgUp przewijanie' : 'PgUp/PgDn przewijanie'),
       ];
       if (this.queued) parts.push(yellow(`${this.queued} w kolejce`));
       lines.push(fitAnsi(' ' + parts.join(dim('  ·  ')), cols));
@@ -342,21 +443,11 @@ class Tui {
     const lines = this.footerLines();
     let s = `${CSI}?25l`;
     if (lines.length !== this.footerH) {
-      const oldBottom = this.bottom;
-      const newH = lines.length;
-      const newBottom = this.rows - newH;
-      if (newH > this.footerH) {
-        // dół rośnie — przesuń czat w górę, żeby nic nie zostało zasłonięte
-        const overflow = Math.max(0, this.top + this.o.row - newBottom);
-        if (overflow) {
-          s += cup(oldBottom, 1) + '\n'.repeat(overflow);
-          this.o.row -= overflow;
-        }
-      } else {
-        for (let r = oldBottom + 1; r <= newBottom; r++) s += cup(r, 1) + `${CSI}2K`;
-      }
-      this.footerH = newH;
+      // dół zmienił wysokość — nowy region czatu i odrysowanie go z pamięci
+      this.footerH = lines.length;
       s += `${CSI}${this.top};${this.bottom}r`;
+      this.syncBuf();
+      s += this.viewportString();
     }
     const top = this.rows - this.footerH + 1;
     lines.forEach((l, k) => (s += cup(top + k, 1) + `${CSI}2K` + l));
@@ -378,93 +469,28 @@ class Tui {
       text = text.replace(/\x1b\[[23]J|\x1b\[H/g, '');
       if (!text) return;
     }
-    // nie pozwól, żeby czat nadpisał dół — kursor zawsze wewnątrz regionu
-    const s = `${CSI}?25l` + cup(this.top + this.o.row, this.o.col + 1) + text;
-    this.track(text);
-    rawWrite(s + this.footerString());
-  }
-
-  // śledzi pozycję kursora czatu na podstawie wypisanego tekstu
-  track(text) {
-    const o = this.o;
-    const cols = this.cols;
-    const maxRow = this.regionH - 1;
-    for (let i = 0; i < text.length; ) {
-      const ch = text[i];
-      if (ch === '\x1b') {
-        if (text[i + 1] === '[') {
-          let j = i + 2;
-          while (j < text.length && !/[\x40-\x7e]/.test(text[j])) j++;
-          this.csi(text.slice(i + 2, j), text[j]);
-          i = j + 1;
-          continue;
-        }
-        if (text[i + 1] === '7') o.saved = { row: o.row, col: o.col };
-        else if (text[i + 1] === '8' && o.saved) Object.assign(o, o.saved, { pending: false });
-        i += 2;
-        continue;
-      }
-      if (ch === '\n') {
-        o.pending = false;
-        o.col = 0;
-        o.row = Math.min(o.row + 1, maxRow);
-        i++;
-        continue;
-      }
-      if (ch === '\r') {
-        o.col = 0;
-        o.pending = false;
-        i++;
-        continue;
-      }
-      if (ch === '\b') {
-        o.col = Math.max(0, o.col - 1);
-        o.pending = false;
-        i++;
-        continue;
-      }
-      if (ch < ' ') {
-        i++;
-        continue;
-      }
-      const cp = text.codePointAt(i);
-      const w = charWidth(cp);
-      if (o.pending && w > 0) {
-        o.pending = false;
-        o.col = 0;
-        o.row = Math.min(o.row + 1, maxRow);
-      }
-      o.col += w;
-      if (o.col >= cols) {
-        o.col = cols - 1;
-        o.pending = true;
-      }
-      i += cp > 0xffff ? 2 : 1;
+    const b = this.buf;
+    this.syncBuf();
+    if (this.scroll > 0) {
+      // użytkownik przegląda starsze wiadomości — zapisz, ale nie ruszaj widoku
+      b.write(text);
+      this.unseen = true;
+      this.drawFooter();
+      return;
     }
-  }
-
-  csi(params, fin) {
-    const o = this.o;
-    if (params.startsWith('?')) return;
-    const n = parseInt(params, 10) || 1;
-    const maxRow = this.regionH - 1;
-    switch (fin) {
-      case 'A': o.row = Math.max(0, o.row - n); break;
-      case 'B': o.row = Math.min(maxRow, o.row + n); break;
-      case 'C': o.col = Math.min(this.cols - 1, o.col + n); break;
-      case 'D': o.col = Math.max(0, o.col - n); break;
-      case 'G': o.col = Math.min(this.cols - 1, n - 1); break;
-      case 'H':
-      case 'f': {
-        const [r, c] = params.split(';').map((x) => parseInt(x, 10) || 1);
-        o.row = Math.min(maxRow, Math.max(0, r - this.top));
-        o.col = Math.min(this.cols - 1, (c || 1) - 1);
-        break;
-      }
-      default:
-        return;
+    // kursor czatu na ekranie odtwarzamy z pamięci, więc dół nigdy nie zostanie nadpisany
+    let prefix = `${CSI}?25l`;
+    if (b.pending && /^[^\r\n\x1b]/.test(text)) {
+      // zawinięcie linii odkładamy do następnego znaku — tak samo jak terminal
+      const { row } = b.screenPos;
+      prefix += cup(this.top + row, this.cols) + '\r\n';
+      b.newline();
+    } else {
+      const { row, col } = b.screenPos;
+      prefix += cup(this.top + row, col + 1);
     }
-    o.pending = false;
+    b.write(text);
+    rawWrite(prefix + text + this.footerString());
   }
 }
 

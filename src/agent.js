@@ -66,6 +66,7 @@ export class Agent {
   reset() {
     this.messages = [];
     this.notes = [];
+    this.shellCwd = this.app.cwd;
     todos.clear();
   }
 
@@ -194,7 +195,9 @@ Plan mode is ON. Only read and analyze (read_file, list_dir, glob, grep, web_fet
     if (!tool) return fail(`Nieznane narzędzie: ${tu.name}`);
     if (tu.parseError) return fail('Nie udało się sparsować argumentów narzędzia (niepoprawny JSON). Spróbuj ponownie.');
 
-    const ctx = { cwd: this.app.cwd, signal };
+    // bieżący katalog (zmienia go `cd` w bash) + katalog projektu; znikły katalog → wracamy do projektu
+    if (!this.shellCwd || !fs.existsSync(this.shellCwd)) this.shellCwd = this.app.cwd;
+    const ctx = { cwd: this.shellCwd, root: this.app.cwd, signal, setCwd: (dir) => (this.shellCwd = dir) };
     const mode = this.app.mode || 'manual';
     if (tool.needsPermission && mode === 'plan') {
       resultLine('Tryb plan — bez zmian w plikach i komend.', c.yellow);
