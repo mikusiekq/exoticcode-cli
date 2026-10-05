@@ -1,9 +1,12 @@
 import {
-  VERSION, BUILTIN_MODELS, DEFAULT_BASE_URL, CONFIG_PATH,
+  VERSION, BUILTIN_MODELS, DEFAULT_BASE_URL, CONFIG_PATH, CONFIG_DIR,
   loadConfig, saveConfig, loadHistory, saveHistory, saveSession, listSessions, newSessionId, SESSIONS_DIR,
 } from './config.js';
 import fs from 'node:fs';
 import path from 'node:path';
+import readline from 'node:readline';
+import { spawn } from 'node:child_process';
+import { latestVersion, isNewer, TARBALL_URL } from './update.js';
 import { ApiClient, ApiError, EFFORTS } from './api.js';
 import { Agent } from './agent.js';
 import { runShell } from './tools.js';
@@ -56,7 +59,7 @@ function parseArgs(argv) {
     else if (v === '-c' || v === '--continue') a.cont = true;
     else if (v === '-h' || v === '--help') a.help = true;
     else if (v === '-v' || v === '--version') a.version = true;
-    else if (i === 0 && (v === 'login' || v === 'logout')) a.command = v;
+    else if (i === 0 && ['login', 'logout', 'uninstall', 'update'].includes(v)) a.command = v;
     else a.prompt.push(v);
   }
   a.prompt = a.prompt.join(' ').trim();
@@ -70,14 +73,65 @@ ${c.bold('Użycie:')}
   exoticcode                 tryb interaktywny
   exoticcode "zadanie"       tryb interaktywny z pierwszą wiadomością
   exoticcode -p "zadanie"    jednorazowe zadanie, wynik na stdout
-  exoticcode login           konfiguracja tokenu
+
+${c.bold('Komendy:')}
+  exoticcode login           konfiguracja: token, model, effort
+  exoticcode logout          usuń zapisany token
+  exoticcode update          sprawdź i zainstaluj nową wersję z GitHuba
+  exoticcode uninstall       usuń EXOTICCODE z komputera
 
 ${c.bold('Opcje:')}
   -m, --model <nazwa>   model dla tej sesji
   -c, --continue        wznów ostatnią sesję z tego katalogu
-  --yolo                nie pytaj o zgodę na zapis plików i komendy
+  --yolo                tryb bypass permissions — nie pytaj o zgodę
   -v, --version         wersja
-  -h, --help            pomoc`);
+  -h, --help            pomoc
+
+${c.dim('W czacie wpisz /help, żeby zobaczyć komendy czatu. Repozytorium: https://github.com/mikusiekq/exoticcode-cli')}`);
+}
+
+// Pytanie tak/nie w zwykłym terminalu (poza czatem).
+function confirm(question) {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: stdin, output: process.stdout });
+    rl.question(question, (a) => {
+      rl.close();
+      resolve(/^(t|tak|y|yes)$/i.test(a.trim()));
+    });
+  });
+}
+
+async function uninstall() {
+  out(`\n  ${c.bold('Odinstalowanie EXOTICCODE')} ${c.dim(VERSION)}\n`);
+  if (!(await confirm(`  Usunąć EXOTICCODE z komputera? ${c.dim('[t/N]')} `))) {
+    out(c.dim('  Anulowano.'));
+    return;
+  }
+  const removeData = fs.existsSync(CONFIG_DIR)
+    ? await confirm(`  Usunąć też ustawienia, token, historię czatów i skille (${CONFIG_DIR})? ${c.dim('[t/N]')} `)
+    : false;
+  out(c.dim('  Usuwam pakiet (npm uninstall -g exoticcode)…'));
+  const isWin = process.platform === 'win32';
+  const code = await new Promise((resolve) => {
+    const child = spawn(isWin ? 'npm.cmd' : 'npm', ['uninstall', '-g', 'exoticcode', '--loglevel=error'], { stdio: 'inherit', shell: isWin });
+    child.on('error', () => resolve(1));
+    child.on('close', resolve);
+  });
+  if (code !== 0) {
+    out(c.red('  ✖ Nie udało się odinstalować pakietu. Spróbuj ręcznie: npm uninstall -g exoticcode'));
+    return;
+  }
+  if (removeData) {
+    try {
+      fs.rmSync(CONFIG_DIR, { recursive: true, force: true });
+      out(c.green(`  ✔ Usunięto dane: ${CONFIG_DIR}`));
+    } catch (e) {
+      out(c.yellow(`  ! Nie udało się usunąć ${CONFIG_DIR}: ${e.message}`));
+    }
+  } else if (fs.existsSync(CONFIG_DIR)) {
+    out(c.dim(`  Ustawienia zostały w ${CONFIG_DIR} (przydadzą się po ponownej instalacji).`));
+  }
+  out(c.green('  ✔ EXOTICCODE został odinstalowany. Do zobaczenia!\n'));
 }
 
 function readAllStdin() {
@@ -866,6 +920,20 @@ export async function main(argv) {
     saveConfig(config);
     out('Wylogowano.');
     return;
+  }
+  if (args.command === 'uninstall') return uninstall();
+  if (args.command === 'update') {
+    const latest = await latestVersion(8000).catch(() => null);
+    if (!latest) return out(c.yellow('  Nie udało się sprawdzić wersji na GitHubie (brak internetu albo brak wydań).'));
+    if (!isNewer(latest, VERSION)) return out(c.green(`  ✔ Masz najnowszą wersję (${VERSION}).`));
+    out(`  Instaluję wersję ${latest}…`);
+    const isWin = process.platform === 'win32';
+    const code = await new Promise((resolve) => {
+      const child = spawn(isWin ? 'npm.cmd' : 'npm', ['install', '-g', TARBALL_URL, '--no-fund', '--no-audit', '--loglevel=error'], { stdio: 'inherit', shell: isWin });
+      child.on('error', () => resolve(1));
+      child.on('close', resolve);
+    });
+    return out(code === 0 ? c.green(`  ✔ Zaktualizowano do ${latest}.`) : c.red('  ✖ Aktualizacja nie powiodła się.'));
   }
 
   // tryb jednorazowy: -p albo dane na stdin
