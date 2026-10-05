@@ -67,27 +67,12 @@ function parseArgs(argv) {
 }
 
 function printUsage() {
-  out(`${c.bold('EXOTICCODE')} ${VERSION} — agent AI do kodowania w terminalu
+  out(`${c.bold('EXOTICCODE')} ${VERSION}
 
-${c.bold('Użycie:')}
-  exoticcode                 tryb interaktywny
-  exoticcode "zadanie"       tryb interaktywny z pierwszą wiadomością
-  exoticcode -p "zadanie"    jednorazowe zadanie, wynik na stdout
-
-${c.bold('Komendy:')}
-  exoticcode login           konfiguracja: token, model, effort
-  exoticcode logout          usuń zapisany token
-  exoticcode update          sprawdź i zainstaluj nową wersję z GitHuba
-  exoticcode uninstall       usuń EXOTICCODE z komputera
-
-${c.bold('Opcje:')}
-  -m, --model <nazwa>   model dla tej sesji
-  -c, --continue        wznów ostatnią sesję z tego katalogu
-  --yolo                tryb bypass permissions — nie pytaj o zgodę
-  -v, --version         wersja
-  -h, --help            pomoc
-
-${c.dim('W czacie wpisz /help, żeby zobaczyć komendy czatu. Repozytorium: https://github.com/mikusiekq/exoticcode-cli')}`);
+  exoticcode             uruchom
+  exoticcode login       zaloguj się
+  exoticcode update      zaktualizuj
+  exoticcode uninstall   odinstaluj`);
 }
 
 // Pytanie tak/nie w zwykłym terminalu (poza czatem).
