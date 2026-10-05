@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
 import { spawn } from 'node:child_process';
-import { latestVersion, isNewer, TARBALL_URL } from './update.js';
+import { latestVersion, isNewer, runNpmInstall, installedVersion } from './update.js';
 import { ApiClient, ApiError, EFFORTS } from './api.js';
 import { Agent } from './agent.js';
 import { runShell } from './tools.js';
@@ -927,13 +927,9 @@ export async function main(argv) {
     if (!latest) return out(c.yellow('  Nie udało się sprawdzić wersji na GitHubie (brak internetu albo brak wydań).'));
     if (!isNewer(latest, VERSION)) return out(c.green(`  ✔ Masz najnowszą wersję (${VERSION}).`));
     out(`  Instaluję wersję ${latest}…`);
-    const isWin = process.platform === 'win32';
-    const code = await new Promise((resolve) => {
-      const child = spawn(isWin ? 'npm.cmd' : 'npm', ['install', '-g', TARBALL_URL, '--no-fund', '--no-audit', '--loglevel=error'], { stdio: 'inherit', shell: isWin });
-      child.on('error', () => resolve(1));
-      child.on('close', resolve);
-    });
-    return out(code === 0 ? c.green(`  ✔ Zaktualizowano do ${latest}.`) : c.red('  ✖ Aktualizacja nie powiodła się.'));
+    const r = await runNpmInstall(latest, 'inherit');
+    const ok = r.ok && installedVersion() === latest;
+    return out(ok ? c.green(`  ✔ Zaktualizowano do ${latest}.`) : c.red(`  ✖ Aktualizacja nie powiodła się (na dysku: ${installedVersion()}).`));
   }
 
   // tryb jednorazowy: -p albo dane na stdin

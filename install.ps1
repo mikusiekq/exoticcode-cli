@@ -18,7 +18,7 @@ if ($major -lt 20) {
 }
 
 Write-Host '  Pobieram i instaluje najnowsza wersje...'
-npm install -g $url --no-fund --no-audit --loglevel=error
+npm install -g $url --prefer-online --no-fund --no-audit --loglevel=error
 if ($LASTEXITCODE -ne 0) {
   Write-Host '  Instalacja nie powiodla sie.' -ForegroundColor Red
   return

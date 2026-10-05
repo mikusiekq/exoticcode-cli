@@ -17,7 +17,7 @@ if [ "$MAJOR" -lt 20 ]; then
 fi
 
 echo "  Pobieram i instaluję najnowszą wersję..."
-if ! npm install -g "$URL" --no-fund --no-audit --loglevel=error; then
+if ! npm install -g "$URL" --prefer-online --no-fund --no-audit --loglevel=error; then
   echo "  Instalacja nie powiodła się. Jeśli to błąd uprawnień, spróbuj: sudo npm install -g $URL"
   exit 1
 fi

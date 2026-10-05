@@ -9,6 +9,9 @@ import { VERSION, loadConfig } from './config.js';
 
 export const REPO = 'mikusiekq/exoticcode-cli';
 export const TARBALL_URL = `https://github.com/${REPO}/releases/latest/download/exoticcode.tgz`;
+// Adres z konkretną wersją — stały adres „latest” npm trzyma w pamięci podręcznej
+// i potrafi zainstalować starą paczkę zamiast nowej.
+export const tarballFor = (version) => `https://github.com/${REPO}/releases/download/v${String(version).replace(/^v/, '')}/exoticcode.tgz`;
 const PKG_ROOT = fileURLToPath(new URL('..', import.meta.url));
 
 const useColor = process.stdout.isTTY && !process.env.NO_COLOR;
@@ -40,17 +43,27 @@ export async function latestVersion(timeoutMs = 2500) {
   return m ? decodeURIComponent(m[1]) : null;
 }
 
-function runNpmInstall() {
+/** Wersja zapisana w package.json na dysku (czytana na nowo, nie z pamięci procesu). */
+export function installedVersion() {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(PKG_ROOT, 'package.json'), 'utf8')).version;
+  } catch {
+    return null;
+  }
+}
+
+export function runNpmInstall(version, stdio = ['ignore', 'pipe', 'pipe']) {
   return new Promise((resolve) => {
     const isWin = process.platform === 'win32';
-    const child = spawn(isWin ? 'npm.cmd' : 'npm', ['install', '-g', TARBALL_URL, '--no-fund', '--no-audit', '--loglevel=error'], {
-      stdio: ['ignore', 'pipe', 'pipe'],
+    const args = ['install', '-g', tarballFor(version), '--prefer-online', '--no-fund', '--no-audit', '--loglevel=error'];
+    const child = spawn(isWin ? 'npm.cmd' : 'npm', args, {
+      stdio,
       shell: isWin,
       windowsHide: true,
     });
     let output = '';
-    child.stdout.on('data', (d) => (output += d));
-    child.stderr.on('data', (d) => (output += d));
+    child.stdout?.on('data', (d) => (output += d));
+    child.stderr?.on('data', (d) => (output += d));
     child.on('error', (e) => resolve({ ok: false, output: e.message }));
     child.on('close', (code) => resolve({ ok: code === 0, output }));
   });
@@ -85,15 +98,20 @@ export async function maybeUpdate(argv) {
   const tick = () => out.write(`\r\x1b[K  ${pink(frames[i++ % frames.length])} Instaluję nową wersję… ${dim(`(${Math.floor((Date.now() - t0) / 1000)}s)`)}`);
   tick();
   const timer = setInterval(tick, 80);
-  const result = await runNpmInstall();
+  const result = await runNpmInstall(latest);
   clearInterval(timer);
   out.write('\r\x1b[K');
+  // upewnij się, że na dysku naprawdę jest nowa wersja (a nie np. stara z pamięci podręcznej npm)
+  if (result.ok && installedVersion() !== latest) {
+    result.ok = false;
+    result.output = `po instalacji na dysku jest wersja ${installedVersion()}, a nie ${latest}`;
+  }
 
   if (!result.ok) {
     out.write(`  ${yellow('!')} Nie udało się zainstalować aktualizacji — uruchamiam obecną wersję ${VERSION}.\n`);
     const tail = result.output.trim().split('\n').slice(-3).join('\n    ');
     if (tail) out.write(dim(`    ${tail}\n`));
-    out.write(dim(`    Ręcznie: npm install -g ${TARBALL_URL}\n\n`));
+    out.write(dim(`    Ręcznie: npm install -g ${tarballFor(latest)}\n\n`));
     await new Promise((r) => setTimeout(r, 1500));
     return false;
   }
