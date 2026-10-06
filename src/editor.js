@@ -104,7 +104,7 @@ export class InputBuffer {
     if (!this.buf.startsWith('/') || /\s/.test(this.buf)) return [];
     const q = this.buf.toLowerCase();
     const list = typeof this.commands === 'function' ? this.commands() : this.commands;
-    const sugs = list.filter(([n]) => n.toLowerCase().startsWith(q)).slice(0, 8);
+    const sugs = list.filter(([n]) => n.toLowerCase().startsWith(q));
     if (this.sugIdx >= sugs.length) this.sugIdx = 0;
     return sugs;
   }
@@ -315,9 +315,10 @@ export class InputBuffer {
 
 /** Lista podpowiedzi komend jako wiersze tekstu. */
 export function renderSuggestions(sugs, sugIdx, cols) {
-  const nameW = Math.max(12, ...sugs.map(([n]) => n.length));
+  const nameW = Math.max(12, Math.min(40, ...sugs.map(([n]) => n.length)));
   return sugs.map(([n, d], k) => {
-    let text = `${n.padEnd(nameW)}  ${d}`;
+    const name = n.length > nameW ? n.slice(0, nameW - 1) + '…' : n.padEnd(nameW);
+    let text = `${name}  ${d}`;
     if (text.length > cols - 5) text = text.slice(0, cols - 6) + '…';
     return k === sugIdx ? accent('  › ') + c.bold(text.slice(0, nameW)) + c.dim(text.slice(nameW)) : '    ' + c.dim(text);
   });
