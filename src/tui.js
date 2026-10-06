@@ -422,7 +422,26 @@ class Tui {
     // 3. podpowiedzi komend albo linia info
     const sugs = this.input?.suggestions() || [];
     if (sugs.length && !this.prompt) {
-      for (const l of renderSuggestions(sugs, this.input.sugIdx, cols)) lines.push(fitAnsi(l, cols));
+      // Oblicz maksymalną liczbę linii podpowiedzi, żeby nie zabierać całego ekranu
+      const usedLines = lines.length; // status + ramka z inputem
+      const maxSugLines = Math.max(3, Math.min(12, this.rows - HEADER - usedLines - 2));
+      
+      // Przewiń okno widoku tak, żeby zaznaczony element był widoczny
+      const idx = this.input.sugIdx;
+      let start = 0;
+      if (sugs.length > maxSugLines) {
+        // Zaznaczony element powinien być w środku widocznego zakresu
+        start = Math.max(0, Math.min(sugs.length - maxSugLines, idx - Math.floor(maxSugLines / 2)));
+      }
+      
+      const visibleSugs = sugs.slice(start, start + maxSugLines);
+      const adjustedIdx = idx - start; // indeks w obrębie widocznych sugestii
+      
+      for (const l of renderSuggestions(visibleSugs, adjustedIdx, cols)) lines.push(fitAnsi(l, cols));
+      if (sugs.length > maxSugLines) {
+        const hidden = sugs.length - maxSugLines;
+        lines.push(fitAnsi(dim(`    … i jeszcze ${hidden} ${hidden === 1 ? 'komenda' : 'komend'} (wpisz więcej, żeby filtrować)`), cols));
+      }
     } else {
       const m = MODES[this.info.mode] || MODES.manual;
       const modeText = `${border(m.icon + ' ' + m.label)} ${dim('(shift+tab)')}`;
