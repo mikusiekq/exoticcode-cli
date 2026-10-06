@@ -315,7 +315,8 @@ export class InputBuffer {
 
 /** Lista podpowiedzi komend jako wiersze tekstu. */
 export function renderSuggestions(sugs, sugIdx, cols) {
-  const nameW = Math.max(12, Math.min(40, ...sugs.map(([n]) => n.length)));
+  // szerokość kolumny nazw: najdłuższa nazwa, ale nie mniej niż 12 i nie więcej niż 40
+  const nameW = Math.max(12, Math.min(40, Math.max(0, ...sugs.map(([n]) => n.length))));
   return sugs.map(([n, d], k) => {
     const name = n.length > nameW ? n.slice(0, nameW - 1) + '…' : n.padEnd(nameW);
     let text = `${name}  ${d}`;
@@ -406,8 +407,12 @@ export function editLine({ prompt = accent('❯ '), history = [], commands = [],
       const sugs = input.suggestions();
       let extra = 0;
       if (sugs.length) {
-        s += '\r\n' + renderSuggestions(sugs, input.sugIdx, cols()).join('\r\n');
-        extra = sugs.length;
+        // prosty widok (małe okno): co najwyżej 8 podpowiedzi naraz, okno przesuwa się za zaznaczeniem
+        const max = 8;
+        const start = Math.max(0, Math.min(sugs.length - max, input.sugIdx - Math.floor(max / 2)));
+        const shownSugs = sugs.slice(start, start + max);
+        s += '\r\n' + renderSuggestions(shownSugs, input.sugIdx - start, cols()).join('\r\n');
+        extra = shownSugs.length;
       } else if (!input.text) {
         s += '\r\n' + c.dim(hint || '  Enter wyślij · Shift+Enter nowa linia · / komendy · Esc przerwij');
         extra = 1;
